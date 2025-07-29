@@ -1,0 +1,32 @@
+
+name: Aggregate Validators on Merge
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  aggregate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Validate validator files
+        run: |
+          python tools/validate_validators.py
+
+      - name: Merge validator entries
+        run: |
+          python tools/merge_validators.py
+
+      - name: Upload merged file as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-validators
+          path: network-config/validators.json
