@@ -19,4 +19,4 @@ jobs:
 
       - name: Run validator metadata check
         run: |
-          python tools/validate_validators.py
+          python tools/internal/validate_validators.py

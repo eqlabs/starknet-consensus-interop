@@ -19,11 +19,11 @@ jobs:
 
       - name: Validate validator files
         run: |
-          python tools/validate_validators.py
+          python tools/internal/validate_validators.py
 
       - name: Merge validator entries
         run: |
-          python tools/merge_validators.py
+          python tools/internal/merge_validators.py
 
       - name: Upload merged file as artifact
         uses: actions/upload-artifact@v4

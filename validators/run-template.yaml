@@ -1,0 +1,29 @@
+# Template for team runtime configuration
+# This file describes how to run a generic validator node for your team
+
+# Docker image used to run the node
+image: eqlabs/pathfinder:latest
+
+# Persistent storage for the validator node
+# This data will be persisted across restarts and redeployments/upgrades.
+data_dir: /usr/share/pathfinder/data
+
+# Size of the persistent disk for the validator node (in GB)
+db_disk_gb: 50
+
+# Where to place the identity file for the validator node
+p2p_identity_path: /app/p2p/identity.json
+
+# Default environment variables
+env:
+  RUST_LOG: info
+
+# Command-line arguments using placeholders:
+#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}
+# These will be filled in per-validator at compose generation time
+cmd:
+  - "--validator-address={{address}}"
+  - "--p2p.consensus.identity-config-file=/identity.json"
+  - "--p2p.consensus.listen-on={{listen_addresses}}"
+  - "--wal-directory=./wal-{{node_name}}"
+  - "--db-file=./db-{{node_name}}"

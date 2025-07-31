@@ -1,0 +1,10 @@
+.deployed-state.json
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+
+# Misc
+admin/
