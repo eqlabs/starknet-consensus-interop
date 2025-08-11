@@ -1,3 +1,4 @@
+network-config/validators.json
 .deployed-state.json
 
 # macOS
@@ -7,4 +8,4 @@
 __pycache__/
 
 # Misc
-admin/
+.admin/

@@ -12,18 +12,26 @@ data_dir: /usr/share/pathfinder/data
 db_disk_gb: 50
 
 # Where to place the identity file for the validator node
-p2p_identity_path: /app/p2p/identity.json
+# Ensure this matches the CLI flag below.
+p2p_identity_path: /identity.json
 
 # Default environment variables
 env:
-  RUST_LOG: info
+    RUST_LOG: info
+
+# Optional: Ports to publish (host:container[/protocol]).
+# These can be used by the deployer to add -p mappings and to define firewall rules.
+# ports:
+#     - { host: 50001, container: 50001, protocol: tcp }
+#     - { host: 50001, container: 50001, protocol: udp }
 
 # Command-line arguments using placeholders:
-#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}
-# These will be filled in per-validator at compose generation time
+#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{peer_addrs}}
+# These will be filled in per-validator at deployment time.
 cmd:
-  - "--validator-address={{address}}"
-  - "--p2p.consensus.identity-config-file=/identity.json"
-  - "--p2p.consensus.listen-on={{listen_addresses}}"
-  - "--wal-directory=./wal-{{node_name}}"
-  - "--db-file=./db-{{node_name}}"
+    - "--validator-address={{address}}"
+    - "--p2p.consensus.identity-config-file=/identity.json"
+    - "--p2p.consensus.listen-on={{listen_addresses}}"
+    - "--bootstrap-peers={{peer_addrs}}"
+    - "--wal-directory=./wal-{{node_name}}"
+    - "--db-file=./db-{{node_name}}"

@@ -1,14 +1,18 @@
-from tools.cloud.provider_base import CloudProvider
-from tools.cloud.gcp.ssh_utils import ssh_connect, ssh_run_command, ssh_upload_file, wait_for_ssh
-from tools.cloud.gcp.ssh_key_utils import ensure_ssh_key_exists
+from tools.gcp.ssh_utils import ssh_connect, ssh_run_command, ssh_upload_file, wait_for_ssh
+from tools.gcp.ssh_key_utils import ensure_ssh_key_exists
+from tools.types import Validator, Instance, Disk
 from googleapiclient import discovery
 from google.oauth2 import service_account
 import time
 import yaml
+from typing import List
 
 
-class GCPProvider(CloudProvider):
-    def __init__(self, project, zone, credentials_path):
+class GCPProvider:
+    def __init__(self, project: str, zone: str, credentials_path: str):
+        """
+        Provider for managing GCP compute resources and deploying validator containers.
+        """
         self.project = project
         self.zone = zone
         self.credentials_path = credentials_path
@@ -18,7 +22,7 @@ class GCPProvider(CloudProvider):
             credentials=service_account.Credentials.from_service_account_file(credentials_path)
         )
 
-        # Ensure SSH key exists and is added to GCP metadata
+        # Ensure SSH key exists and is added to GCP project-wide metadata
         ensure_ssh_key_exists(
             project_id=project,
             credentials_path=credentials_path,
@@ -26,14 +30,17 @@ class GCPProvider(CloudProvider):
             username='ubuntu'
         )
 
-        # Ensure we can connect via SSH
+        # Ensure we can connect via SSH (creates firewall rule if missing)
         self._ensure_firewall_rule()
 
-    def create_instance(self, validator):
+    def create_instance(self, validator: Validator) -> Instance:
+        """
+        Create an instance for a validator if it does not exist.
+        Returns a minimal instance dict with the instance name.
+        """
         name = validator["node_name"]
         print(f"🌐 Creating GCP instance: {name}")
 
-        # Skip if instance exists
         existing = self.compute.instances().list(project=self.project, zone=self.zone).execute()
         if any(i["name"] == name for i in existing.get("items", [])):
             print(f"⚠️ Instance '{name}' already exists, skipping creation.")
@@ -61,7 +68,11 @@ class GCPProvider(CloudProvider):
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
         return {"name": name}
 
-    def create_volume(self, validator, disk_size=50):
+    def create_volume(self, validator: Validator, disk_size: int = 50) -> str:
+        """
+        Create a persistent disk for the validator's data if needed.
+        Returns the disk name.
+        """
         name = f"{validator['node_name']}-db"
         print(f"💾 Creating GCP persistent disk: {name}")
 
@@ -85,7 +96,10 @@ class GCPProvider(CloudProvider):
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
         return name
 
-    def attach_volume(self, instance, volume_name):
+    def attach_volume(self, instance: Instance, volume_name: str):
+        """
+        Attach the data disk to the given instance, if not already attached.
+        """
         name = instance["name"]
         print(f"🔗 Attaching disk {volume_name} to instance {name}")
         inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
@@ -93,7 +107,7 @@ class GCPProvider(CloudProvider):
             print(f"⚠️ Disk already attached to '{name}', skipping.")
             return
 
-        config = {
+        config: Disk = {
             "source": f"projects/{self.project}/zones/{self.zone}/disks/{volume_name}",
             "autoDelete": False,
             "boot": False
@@ -104,7 +118,14 @@ class GCPProvider(CloudProvider):
         ).execute()
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
 
-    def deploy_validator(self, instance, validator):
+    def deploy_validator(self, instance: Instance, validator: Validator, peer_addrs: str = ""):
+        """
+        Deploy or redeploy the validator container on the instance.
+        - Ensures Docker is installed
+        - Uploads identity file and mounts persistent disk
+        - Publishes ports if defined in run.yaml
+        - Renders command with placeholders including {{peer_addrs}}
+        """
         name = validator["node_name"]
         ip = self._get_instance_ip(name)
         print(f"📦 Deploying validator on {name} ({ip})")
@@ -149,17 +170,31 @@ class GCPProvider(CloudProvider):
         cmd += f"  -v {host_data_dir}:{container_data_dir} \\\n"
         cmd += f"  -v {remote_identity_path}:{identity_target} \\\n"
 
+        # Optional port mappings from run.yaml
+        for p in config.get("ports", []):
+            host = p.get("host")
+            container = p.get("container")
+            protocol = p.get("protocol", "tcp")
+            if host is not None and container is not None:
+                if protocol:
+                    cmd += f"  -p {host}:{container}/{protocol} \\\n"
+                else:
+                    cmd += f"  -p {host}:{container} \\\n"
+
+        # Environment variables
         for k, v in config.get("env", {}).items():
             cmd += f"  -e {k}={v} \\\n"
 
         cmd += f"  --name {name} {config['image']} \\\n"
 
+        # Command with templating (including peer_addrs)
         for arg in config["cmd"]:
             rendered = arg.replace("{{address}}", validator["address"]) \
-                        .replace("{{node_name}}", name) \
-                        .replace("{{peer_id}}", validator["peer_id"]) \
-                        .replace("{{team}}", validator["team"]) \
-                        .replace("{{listen_addresses}}", ",".join(validator["listen_addresses"]))
+                          .replace("{{node_name}}", name) \
+                          .replace("{{peer_id}}", validator["peer_id"]) \
+                          .replace("{{team}}", validator["team"]) \
+                          .replace("{{listen_addresses}}", ",".join(validator["listen_addresses"])) \
+                          .replace("{{peer_addrs}}", peer_addrs or "")
             cmd += f"  {rendered} \\\n"
 
         cmd = cmd.rstrip(" \\\n")
@@ -171,15 +206,29 @@ class GCPProvider(CloudProvider):
 
         client.close()
 
-
-    def _get_instance_ip(self, name):
+    def _get_instance_ip(self, name: str) -> str:
+        """
+        Internal: Fetch public IP for an instance.
+        """
         inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
         return inst["networkInterfaces"][0]["accessConfigs"][0]["natIP"]
 
-    def list_instances(self):
+    def get_instance_ip(self, name: str) -> str:
+        """
+        Public wrapper to fetch the instance public IP.
+        """
+        return self._get_instance_ip(name)
+
+    def list_instances(self) -> List[Instance]:
+        """
+        List instances in the configured project/zone.
+        """
         return self.compute.instances().list(project=self.project, zone=self.zone).execute().get("items", [])
 
-    def _ensure_firewall_rule(self):
+    def _ensure_firewall_rule(self) -> None:
+        """
+        Ensure an SSH ingress firewall rule exists to allow tcp:22 to instances tagged 'validator'.
+        """
         print("🌐 Checking for SSH firewall rule...")
         firewalls = self.compute.firewalls().list(project=self.project).execute()
         if any(rule["name"] == "allow-ssh" for rule in firewalls.get("items", [])):
@@ -196,11 +245,33 @@ class GCPProvider(CloudProvider):
             "description": "Allow SSH access to validator nodes"
         }
         op = self.compute.firewalls().insert(project=self.project, body=rule_body).execute()
-        _wait_for_global_operation(op["name"])
+        # FIX: Call the instance method to wait for global operation
+        self._wait_for_global_operation(op["name"])
         print("✅ SSH firewall rule created.")
+
+    def _wait_for_global_operation(self, operation_name: str):
+        """
+        Wait for a global operation to complete.
+        """
+        print(f"⏳ Waiting for global operation {operation_name} to complete...")
+        while True:
+            result = self.compute.globalOperations().get(
+                project=self.project,
+                operation=operation_name
+            ).execute()
+
+            if result.get("status") == "DONE":
+                if "error" in result:
+                    raise Exception(f"❌ Global operation failed: {result['error']}")
+                print("✅ Global operation completed.")
+                break
+            time.sleep(2)
 
 
 def _wait_for_operation(compute, project, zone, operation_name):
+    """
+    Wait for a zonal operation to complete.
+    """
     print(f"⏳ Waiting for operation {operation_name} to complete...")
     while True:
         result = compute.zoneOperations().get(
@@ -216,9 +287,10 @@ def _wait_for_operation(compute, project, zone, operation_name):
             break
         time.sleep(2)
 
-
-
 def _wait_for_disk(client, disk_name, timeout=30):
+    """
+    Wait for the udev device for the given persistent disk to settle on the VM.
+    """
     print(f"⏳ Waiting for disk device google-{disk_name} to become available...")
     cmd = f"sudo udevadm settle --timeout={timeout}"
     stdin, stdout, stderr = client.exec_command(cmd)
@@ -226,18 +298,5 @@ def _wait_for_disk(client, disk_name, timeout=30):
     if exit_code != 0:
         raise RuntimeError(f"Disk device /dev/disk/by-id/google-{disk_name} did not settle within {timeout}s")
 
-def _wait_for_global_operation(self, operation_name):
-    print(f"⏳ Waiting for global operation {operation_name} to complete...")
-    while True:
-        result = self.compute.globalOperations().get(
-            project=self.project,
-            operation=operation_name
-        ).execute()
 
-        if result.get("status") == "DONE":
-            if "error" in result:
-                raise Exception(f"❌ Global operation failed: {result['error']}")
-            print("✅ Global operation completed.")
-            break
-        time.sleep(2)
-
+# TODO: Why some of these wait functions are in the class and some are not?
