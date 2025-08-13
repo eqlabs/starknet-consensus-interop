@@ -19,6 +19,7 @@ from tools.gcp.provider import GCPProvider
 VALIDATORS_FILE = "network-config/validators.json"
 DEPLOY_STATE_FILE = ".deployed-state.json"
 
+
 def load_validators() -> List[Validator]:
     """
     Load validators from network-config/validators.json.
@@ -26,12 +27,14 @@ def load_validators() -> List[Validator]:
     with open(VALIDATORS_FILE) as f:
         return json.load(f)
 
+
 def save_state(state):
     """
     Persist deployment state (including instance IPs) to DEPLOY_STATE_FILE.
     """
     with open(DEPLOY_STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
+
 
 def load_state():
     """
@@ -42,8 +45,10 @@ def load_state():
             return json.load(f)
     return {}
 
+
 def _utc_now_iso():
     return datetime.now(timezone.utc).isoformat()
+
 
 def _get_disk_size(team: str) -> int:
     """
@@ -53,6 +58,7 @@ def _get_disk_size(team: str) -> int:
     with open(run_file) as f:
         config = yaml.safe_load(f)
     return int(config.get("db_disk_gb", 50))
+
 
 def _collect_ips(provider: GCPProvider, validators: List[Validator]) -> dict:
     """
@@ -64,9 +70,32 @@ def _collect_ips(provider: GCPProvider, validators: List[Validator]) -> dict:
         name_to_ip[name] = provider.get_instance_ip(name)
     return name_to_ip
 
+
+def _derive_p2p_ports_from_listen_addresses(validators: List[Validator]) -> List[dict]:
+    """
+    Derive unique ports and protocols from all validators' listen_addresses.
+    Returns a list of dicts: {"port": <str>, "protocol": "tcp"|"udp"}
+    """
+    seen = set()
+    ports = []
+    for v in validators:
+        for addr in v.get("listen_addresses", []):
+            parts = addr.strip().split("/")
+            # ['', 'ip4', '127.0.0.1', 'tcp', '50001', ...]
+            if len(parts) >= 5:
+                proto = parts[4 - 1]
+                port = parts[5 - 1]
+                if proto in ("tcp", "udp") and port.isdigit():
+                    key = (proto, port)
+                    if key not in seen:
+                        seen.add(key)
+                        ports.append({"protocol": proto, "port": port})
+    return ports
+
+
 def provision_infra(provider: GCPProvider, validators: List[Validator]) -> None:
     """
-    Stage 1: Create instances, create/attach disks, and persist instance IPs to state.
+    Stage 1: Create instances, create/attach disks, ensure P2P firewall, and persist instance IPs to state.
     """
     state = {
         "metadata": {
@@ -96,6 +125,10 @@ def provision_infra(provider: GCPProvider, validators: List[Validator]) -> None:
             "peer_id": v["peer_id"]
         }
 
+    # Ensure inter-validator P2P firewall based on listen_addresses
+    p2p_ports = _derive_p2p_ports_from_listen_addresses(validators)
+    provider.ensure_p2p_firewall(p2p_ports)
+
     # Collect and persist public IPs after all instances exist
     ips = _collect_ips(provider, validators)
     for name, ip in ips.items():
@@ -105,31 +138,92 @@ def provision_infra(provider: GCPProvider, validators: List[Validator]) -> None:
     save_state(state)
     print("✅ Infra provisioning complete and state saved.")
 
+
+def _normalize_multiaddr_with_ip(listen_addr: str, public_ip: str) -> str:
+    # Replace localhost/0.0.0.0 with the public IP, preserve protocol/port
+    # Expected forms like: /ip4/127.0.0.1/tcp/50001 or /ip4/0.0.0.0/tcp/50001
+    parts = listen_addr.strip().split("/")
+    # ['', 'ip4', '127.0.0.1', 'tcp', '50001', ...]
+    if len(parts) >= 4 and parts[1] == "ip4":
+        host = parts[2]
+        if host in ("127.0.0.1", "0.0.0.0"):
+            parts[2] = public_ip
+        # else: keep advertised IP
+    return "/".join(parts)
+
+
+def _build_bootstrap_addrs(validators: List[Validator], name_to_ip: dict) -> dict:
+    """
+    For each validator, produce a CSV of bootstrap multiaddrs for all other validators:
+    - Start from each peer's listen_addresses.
+    - Substitute peer's public IP where the listen addr is localhost/0.0.0.0.
+    - Append /p2p/<peer_id>.
+    - Use the first normalized listen address per peer (keeps list short).
+    """
+    by_name = {v["node_name"]: v for v in validators}
+    result = {}
+    for name, v in by_name.items():
+        peers = []
+        for peer_name, pv in by_name.items():
+            if peer_name == name:
+                continue
+            pub_ip = name_to_ip.get(peer_name)
+            if not pub_ip:
+                continue
+            la_list = pv.get("listen_addresses", [])
+            if not la_list:
+                continue
+            # take first listen address; can be extended to include all
+            base = _normalize_multiaddr_with_ip(la_list[0], pub_ip)
+            peers.append(f"{base}/p2p/{pv['peer_id']}")
+        # dedupe and join
+        seen = set()
+        uniq = []
+        for a in peers:
+            if a not in seen:
+                seen.add(a)
+                uniq.append(a)
+        result[name] = ",".join(uniq)
+    return result
+
+
+def _build_validator_addrs(validators: List[Validator]) -> dict:
+    """
+    For each validator, produce a CSV of all other validators' addresses.
+    """
+    result = {}
+    by_name = {v["node_name"]: v for v in validators}
+    for name, v in by_name.items():
+        others = [ov["address"] for on, ov in by_name.items() if on != name]
+        result[name] = ",".join(others)
+    return result
+
+
 def deploy_apps(provider: GCPProvider, validators: List[Validator]) -> None:
-    """
-    Stage 2: Deploy validator containers, injecting peer addresses from saved instance IPs.
-    """
     state = load_state()
     name_to_ip = {name: info.get("ip") for name, info in state.get("validators", {}).items()}
 
-    # Fallback to live lookup if any IP missing
     for v in validators:
         name = v["node_name"]
         if not name_to_ip.get(name):
             name_to_ip[name] = provider.get_instance_ip(name)
 
+    bootstrap_map = _build_bootstrap_addrs(validators, name_to_ip)
+    validator_addrs_map = _build_validator_addrs(validators)
+
     for v in validators:
         name = v["node_name"]
-        peer_addrs = ",".join(ip for n, ip in name_to_ip.items() if n != name and ip)
-        # provider.deploy_validator expects an instance dict with a name
-        provider.deploy_validator({"name": name}, v, peer_addrs=peer_addrs)
+        peer_addrs = bootstrap_map.get(name, "")
+        validator_addrs = validator_addrs_map.get(name, "")
+        provider.deploy_validator({"name": name}, v, peer_addrs=peer_addrs, validator_addrs=validator_addrs)
+
 
 def main():
     """
     Deploy validators to GCP in stages.
     Usage:
-      --stage infra  : create/update instances and disks, record IPs
-      --stage app    : deploy containers, injecting peer_addrs
+      --stage infra  : create/update instances and disks, record IPs, ensure P2P firewall
+      --stage app    : deploy containers, injecting peer_addrs and validator_addrs
       --stage all    : run both stages (default)
     """
     parser = argparse.ArgumentParser(description="Deploy validators to GCP")
@@ -150,6 +244,7 @@ def main():
         provision_infra(provider, validators)
     if args.stage in ("app", "all"):
         deploy_apps(provider, validators)
+
 
 if __name__ == "__main__":
     main()

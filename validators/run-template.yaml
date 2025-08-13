@@ -19,19 +19,14 @@ p2p_identity_path: /identity.json
 env:
     RUST_LOG: info
 
-# Optional: Ports to publish (host:container[/protocol]).
-# These can be used by the deployer to add -p mappings and to define firewall rules.
-# ports:
-#     - { host: 50001, container: 50001, protocol: tcp }
-#     - { host: 50001, container: 50001, protocol: udp }
-
 # Command-line arguments using placeholders:
-#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{peer_addrs}}
+#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{peer_addrs}}, {{validator_addrs}}
 # These will be filled in per-validator at deployment time.
 cmd:
     - "--validator-address={{address}}"
     - "--p2p.consensus.identity-config-file=/identity.json"
     - "--p2p.consensus.listen-on={{listen_addresses}}"
     - "--bootstrap-peers={{peer_addrs}}"
+    - "--validators={{validator_addrs}}"
     - "--wal-directory=./wal-{{node_name}}"
     - "--db-file=./db-{{node_name}}"

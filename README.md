@@ -42,6 +42,49 @@ Each validator metadata file must use an address from your team's assigned range
 
 ---
 
+## 🧾 Validator metadata file (`validators/<team>/validator_0xNNNN.json`)
+
+Defines one validator for your team. One file per validator.
+
+- **Filename**: `validator_<address>.json` (e.g., `validator_0x4001.json`)
+- **Location**: `validators/<team>/`
+- **Required fields**
+  - `team` (string): Team slug; must match the directory name (e.g., `pathfinder`).
+  - `node_name` (string): DNS-safe, unique across all validators; used for GCP instance, disk, and container names. Suggested format: `<team>-<name>` (e.g., `pathfinder-alice`).
+  - `address` (string): Hex address assigned to your team (e.g., `0x4001`).
+  - `peer_id` (string): libp2p PeerId corresponding to your identity file.
+  - `listen_addresses` (string[]): libp2p multiaddrs the node will listen on (e.g., `/ip4/0.0.0.0/tcp/50001`). Multiple allowed.
+- **Identity file**
+  - Place `id_<address>.json` alongside this file (e.g., `id_0x4001.json`). It’s uploaded to the VM and mounted at `p2p_identity_path` (default `/identity.json`).
+  - The `peer_id` in this JSON should match the identity’s public key.
+- **How it’s used**
+  - These files are aggregated into `network-config/validators.json` by CI.
+  - `tools/deploynet.py` uses them to:
+    - Create/label instances and disks.
+    - Render CLI args (`{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{listen_addresses}}`, etc.).
+    - Inject bootstrap peers (`{{peer_addrs}}`, libp2p multiaddrs, excludes self).
+    - Inject validator set (`{{validator_addrs}}`, other validator addresses, excludes self).
+
+Example:
+```json
+{
+  "team": "pathfinder",
+  "node_name": "pathfinder-alice",
+  "address": "0x4001",
+  "listen_addresses": [
+    "/ip4/0.0.0.0/tcp/50001"
+  ],
+  "peer_id": "12D3KooWDJryKaxjwNCk6yTtZ4GbtbLrH7JrEUTngvStaDttLtid"
+}
+```
+
+Notes:
+- If you expose P2P ports, ensure `listen_addresses` includes the correct ports. The deployer will publish these ports in Docker and open a GCP firewall rule between validator instances automatically.
+- Do not edit `network-config/validators.json` directly; it’s generated.
+
+
+---
+
 ## 🚀 Deploying the Network
 
 Deployment is handled via `tools/deploynet.py`, which provisions GCP resources and deploys validator containers using team configs.
@@ -86,12 +129,14 @@ What happens:
   - Creates/reuses GCP instances (tagged `validator`)
   - Creates/reuses/attaches persistent disks
   - Resolves and saves public IPs to `.deployed-state.json`
+  - Creates a GCP firewall rule `allow-validator-p2p` that allows the ports present in `listen_addresses` between validator instances
 
 - App:
   - Uploads identity files
   - Mounts disks and pulls images
   - Starts each node container with team-specific `run.yaml`
-  - Injects a peers list via `{{peer_addrs}}` (all other nodes’ public IPs)
+  - Injects bootstrap peers via `{{peer_addrs}}` (libp2p multiaddrs with `/p2p/<peer_id>`)
+  - Injects validator set via `{{validator_addrs}}` (CSV of other validators’ addresses)
 
 > ✅ Re-running is safe: existing instances/disks are reused, containers are restarted cleanly.
 
@@ -149,11 +194,11 @@ The deployer writes `.deployed-state.json` with instance IPs and metadata:
     - `db_disk_gb`: Size of the persistent disk in GB (default 50).
     - `p2p_identity_path`: Where to mount the uploaded identity in the container (default `/identity.json`). Must match your CLI flag.
     - `env`: Map of environment variables.
-    - `ports`: List of port mappings: `{ host, container, protocol? }` used for docker `-p` (no firewall opened by default).
 - **Placeholders you can use in `cmd`**
-    - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{peer_addrs}}`
-    - `{{listen_addresses}}` is a CSV from `validators.json`.
-    - `{{peer_addrs}}` is a CSV of other nodes’ public IPs (self excluded) from `.deployed-state.json`.
+    - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{peer_addrs}}`, `{{validator_addrs}}`
+    - `{{listen_addresses}}`: CSV from `validators.json`.
+    - `{{peer_addrs}}`: CSV of libp2p multiaddrs built from each peer’s listen address + public IP + `/p2p/<peer_id>` (excludes self).
+    - `{{validator_addrs}}`: CSV of other validators’ addresses (excludes self).
 
 Example `run.yaml`
 
@@ -169,18 +214,15 @@ p2p_identity_path: /identity.json
 env:
     RUST_LOG: info
 
-# Optional; adds docker -p mappings (no firewall opened automatically)
-# ports:
-#     - { host: 50001, container: 50001, protocol: tcp }
-
 cmd:
     - "--validator-address={{address}}"
     - "--p2p.consensus.identity-config-file=/identity.json"
     - "--p2p.consensus.listen-on={{listen_addresses}}"
     - "--bootstrap-peers={{peer_addrs}}"
+    - "--validators={{validator_addrs}}"
 ```
 
-- **Networking note**: Only SSH (tcp:22) is open by default. If your node needs public p2p ports, add them in `ports` and coordinate firewall rules in GCP.
+- **Networking note**: P2P ports are derived from `listen_addresses`. The deployer publishes these in Docker and creates a GCP firewall rule between validator instances automatically.
 - **Identity note**: The deployer uploads `validators/<team>/id_<address>.json` and mounts it at `p2p_identity_path`. Ensure your CLI flag uses the same path.
 - **Templating source**: Values come from `network-config/validators.json` and the saved `.deployed-state.json` created during `--stage infra`.
 

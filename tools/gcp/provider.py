@@ -5,6 +5,7 @@ from googleapiclient import discovery
 from google.oauth2 import service_account
 import time
 import yaml
+import os
 from typing import List
 
 
@@ -118,16 +119,16 @@ class GCPProvider:
         ).execute()
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
 
-    def deploy_validator(self, instance: Instance, validator: Validator, peer_addrs: str = ""):
+    def deploy_validator(self, instance: Instance, validator: Validator, peer_addrs: str = "", validator_addrs: str = ""):
         """
         Deploy or redeploy the validator container on the instance.
         - Ensures Docker is installed
         - Uploads identity file and mounts persistent disk
-        - Publishes ports if defined in run.yaml
-        - Renders command with placeholders including {{peer_addrs}}
+        - Publishes ports derived from validator listen_addresses
+        - Renders command with placeholders including {{peer_addrs}} and {{validator_addrs}}
         """
         name = validator["node_name"]
-        ip = self._get_instance_ip(name)
+        ip = self.get_instance_ip(name)
         print(f"📦 Deploying validator on {name} ({ip})")
 
         wait_for_ssh(ip)
@@ -138,6 +139,13 @@ class GCPProvider:
             client,
             "if ! command -v docker > /dev/null; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io; fi"
         )
+
+        # Allow user to use Docker without sudo (if SSH_USERNAME set)
+        ssh_user = os.environ.get("SSH_USERNAME")
+        if ssh_user:
+            ssh_run_command(client, f"sudo groupadd -f docker && sudo usermod -aG docker {ssh_user}")
+            # Ensure current socket permissions are correct (immediate convenience; full effect on next login)
+            ssh_run_command(client, "if [ -S /var/run/docker.sock ]; then sudo chown root:docker /var/run/docker.sock && sudo chmod 660 /var/run/docker.sock; fi")
 
         # Upload identity file
         local_identity_path = f"validators/{validator['team']}/id_{validator['address']}.json"
@@ -170,16 +178,20 @@ class GCPProvider:
         cmd += f"  -v {host_data_dir}:{container_data_dir} \\\n"
         cmd += f"  -v {remote_identity_path}:{identity_target} \\\n"
 
-        # Optional port mappings from run.yaml
-        for p in config.get("ports", []):
-            host = p.get("host")
-            container = p.get("container")
-            protocol = p.get("protocol", "tcp")
-            if host is not None and container is not None:
-                if protocol:
-                    cmd += f"  -p {host}:{container}/{protocol} \\\n"
-                else:
-                    cmd += f"  -p {host}:{container} \\\n"
+        # Publish ports derived from listen_addresses
+        published = set()
+        for addr in validator.get("listen_addresses", []):
+            parts = addr.strip().split("/")
+            # ['', 'ip4', '127.0.0.1', 'tcp', '50001', ...]
+            if len(parts) >= 5:
+                proto = parts[4 - 1]  # 'tcp' or 'udp' at index 3
+                port = parts[5 - 1]   # port at index 4
+                if proto in ("tcp", "udp") and port.isdigit():
+                    key = (proto, port)
+                    if key in published:
+                        continue
+                    published.add(key)
+                    cmd += f"  -p {port}:{port}/{proto} \\\n"
 
         # Environment variables
         for k, v in config.get("env", {}).items():
@@ -187,14 +199,15 @@ class GCPProvider:
 
         cmd += f"  --name {name} {config['image']} \\\n"
 
-        # Command with templating (including peer_addrs)
+        # Command with templating (including peer_addrs and validator_addrs)
         for arg in config["cmd"]:
             rendered = arg.replace("{{address}}", validator["address"]) \
                           .replace("{{node_name}}", name) \
                           .replace("{{peer_id}}", validator["peer_id"]) \
                           .replace("{{team}}", validator["team"]) \
                           .replace("{{listen_addresses}}", ",".join(validator["listen_addresses"])) \
-                          .replace("{{peer_addrs}}", peer_addrs or "")
+                          .replace("{{peer_addrs}}", peer_addrs or "") \
+                          .replace("{{validator_addrs}}", validator_addrs or "")
             cmd += f"  {rendered} \\\n"
 
         cmd = cmd.rstrip(" \\\n")
@@ -208,16 +221,82 @@ class GCPProvider:
 
     def _get_instance_ip(self, name: str) -> str:
         """
-        Internal: Fetch public IP for an instance.
+        Internal: Fetch public IP for an instance if already assigned.
+        Raises a descriptive error if the structure is missing.
         """
         inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
-        return inst["networkInterfaces"][0]["accessConfigs"][0]["natIP"]
+        nics = inst.get("networkInterfaces", [])
+        if not nics:
+            raise RuntimeError(f"Instance '{name}' has no network interfaces")
+        access_configs = nics[0].get("accessConfigs", [])
+        if not access_configs:
+            raise RuntimeError(f"Instance '{name}' has no external access config; cannot fetch public IP")
+        ip = access_configs[0].get("natIP")
+        if not ip:
+            raise RuntimeError(f"Public IP not yet assigned for instance '{name}'")
+        return ip
 
     def get_instance_ip(self, name: str) -> str:
         """
         Public wrapper to fetch the instance public IP.
+        - If the instance is stopped, start it and wait until RUNNING.
+        - If there is no external access config, add one.
+        - Poll until a natIP is assigned or timeout.
         """
-        return self._get_instance_ip(name)
+        # Ensure instance exists and is running
+        inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
+        status = inst.get("status")
+        if status != "RUNNING":
+            print(f"▶️ Instance '{name}' status is {status}; starting it...")
+            op = self.compute.instances().start(project=self.project, zone=self.zone, instance=name).execute()
+            _wait_for_operation(self.compute, self.project, self.zone, op["name"])
+            # Wait until status is RUNNING
+            deadline = time.time() + 180
+            while time.time() < deadline:
+                inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
+                if inst.get("status") == "RUNNING":
+                    break
+                time.sleep(2)
+            else:
+                raise RuntimeError(f"Instance '{name}' did not reach RUNNING state in time")
+
+        # Ensure there is an external access config
+        inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
+        nics = inst.get("networkInterfaces", [])
+        if not nics:
+            raise RuntimeError(f"Instance '{name}' has no network interfaces")
+        nic_name = nics[0].get("name", "nic0")
+        access_configs = nics[0].get("accessConfigs", [])
+        if not access_configs:
+            print(f"➕ Adding external access config to instance '{name}' on {nic_name} ...")
+            body = {"type": "ONE_TO_ONE_NAT", "name": "External NAT"}
+            op = self.compute.instances().addAccessConfig(
+                project=self.project,
+                zone=self.zone,
+                instance=name,
+                networkInterface=nic_name,
+                body=body
+            ).execute()
+            _wait_for_operation(self.compute, self.project, self.zone, op["name"])
+
+        # Poll until natIP is populated
+        print(f"⏳ Waiting for public IP of instance '{name}' ...")
+        deadline = time.time() + 180
+        last_err = None
+        while time.time() < deadline:
+            try:
+                inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
+                nics = inst.get("networkInterfaces", [])
+                if nics and nics[0].get("accessConfigs"):
+                    ip = nics[0]["accessConfigs"][0].get("natIP")
+                    if ip:
+                        return ip
+            except Exception as e:
+                last_err = e
+            time.sleep(2)
+        raise RuntimeError(
+            f"Failed to obtain public IP for instance '{name}' within timeout. Last error: {last_err}"
+        )
 
     def list_instances(self) -> List[Instance]:
         """
@@ -248,6 +327,46 @@ class GCPProvider:
         # FIX: Call the instance method to wait for global operation
         self._wait_for_global_operation(op["name"])
         print("✅ SSH firewall rule created.")
+
+    def ensure_p2p_firewall(self, port_specs: List[dict]) -> None:
+        """
+        Ensure an ingress firewall rule that allows validator-to-validator P2P traffic
+        on the specified ports/protocols. Uses the 'validator' network tag for both
+        source and target. Port specs are dicts with keys: 'port' (str/int), 'protocol' ('tcp'|'udp').
+        """
+        # Build allowed entries grouped by protocol
+        by_proto = {}
+        for p in port_specs or []:
+            proto = str(p.get("protocol", "tcp")).lower()
+            port = str(p.get("port"))
+            if not port or not port.isdigit():
+                continue
+            by_proto.setdefault(proto, set()).add(port)
+
+        allowed = [{"IPProtocol": proto, "ports": sorted(list(ports))} for proto, ports in by_proto.items() if ports]
+        if not allowed:
+            print("ℹ️ No P2P ports to allow; skipping P2P firewall.")
+            return
+
+        rule_name = "allow-validator-p2p"
+        print(f"🌐 Ensuring firewall rule '{rule_name}' for validator P2P: {allowed}")
+
+        firewalls = self.compute.firewalls().list(project=self.project).execute()
+        if any(rule["name"] == rule_name for rule in (firewalls.get("items") or [])):
+            print(f"✅ Firewall rule '{rule_name}' already exists.")
+            return
+
+        body = {
+            "name": rule_name,
+            "allowed": allowed,
+            "direction": "INGRESS",
+            "sourceTags": ["validator"],
+            "targetTags": ["validator"],
+            "description": "Allow P2P traffic between validator nodes",
+        }
+        op = self.compute.firewalls().insert(project=self.project, body=body).execute()
+        self._wait_for_global_operation(op["name"])
+        print(f"✅ Firewall rule '{rule_name}' created.")
 
     def _wait_for_global_operation(self, operation_name: str):
         """
