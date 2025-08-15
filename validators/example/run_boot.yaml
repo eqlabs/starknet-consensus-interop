@@ -1,0 +1,17 @@
+# Example team boot node runtime configuration
+# Deployed as validators/example/run_boot.yaml
+
+image: tt00tss/interop-tests:bootnode
+
+data_dir: /var/lib/bootnode
+p2p_identity_path: /identity.json
+
+env:
+    RUST_LOG: "p2p=trace,libp2p_core=trace,libp2p_gossipsub=off,libp2p_identify=trace,libp2p_kad=trace,libp2p_noise=off,libp2p_ping=off,libp2p_server=off,libp2p_stream=trace,libp2p_swarm=trace,libp2p_tcp=off,libp2p_yamux=trace"
+
+cmd:
+    - "--network={{network}}"
+    - "--listen-on={{listen_addresses}}"
+    - "--identity-config-file=/identity.json"
+    - "--bootstrap-interval-seconds=5"
+    - "--pretty-log"

@@ -1,0 +1,27 @@
+# Docker image used to run the node
+image: tt00tss/interop-tests:validator
+
+# Persistent storage for the validator node
+# This data will be persisted across restarts and redeployments/upgrades.
+data_dir: /usr/share/example/data
+
+# Size of the persistent disk for the validator node (in GB)
+db_disk_gb: 20
+
+# Where to place the identity file for the validator node
+# Ensure this matches the CLI flag below.
+p2p_identity_path: /identity.json
+
+env:
+    RUST_LOG: "validator=trace,pathfinder_consensus=trace,p2p=off,informalsystems_malachitebft_core_consensus=trace"
+
+cmd:
+    - "--validator-address={{address}}"
+    - "--validators={{validator_addrs}}"
+    - "--p2p.consensus.identity-config-file=/identity.json"
+    - "--p2p.consensus.listen-on={{listen_addresses}}"
+    - "--p2p.consensus.experimental.direct-connection-timeout=1"
+    - "--p2p.consensus.experimental.eviction-timeout=1"
+    - "--p2p.consensus.bootstrap-addresses={{peer_addrs}}"
+    - "--wal-directory=./wal-{{node_name}}"
+    - "--db-file=./db-{{node_name}}"
