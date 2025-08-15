@@ -1,5 +1,5 @@
-# Template for team runtime configuration
-# This file describes how to run a generic validator node for your team
+# Template for team validator runtime configuration
+# Copy this to validators/<team>/run_validator.yaml and adjust as needed
 
 # Docker image used to run the node
 image: eqlabs/pathfinder:latest
@@ -20,13 +20,14 @@ env:
     RUST_LOG: info
 
 # Command-line arguments using placeholders:
-#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{peer_addrs}}, {{validator_addrs}}
+#   {{address}}, {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{bootstrap_addrs}}, {{validator_addrs}}, {{network}}
 # These will be filled in per-validator at deployment time.
 cmd:
     - "--validator-address={{address}}"
     - "--p2p.consensus.identity-config-file=/identity.json"
     - "--p2p.consensus.listen-on={{listen_addresses}}"
-    - "--bootstrap-peers={{peer_addrs}}"
+    - "--p2p.consensus.bootstrap-addresses={{bootstrap_addrs}}"
     - "--validators={{validator_addrs}}"
+    - "--network={{network}}"
     - "--wal-directory=./wal-{{node_name}}"
     - "--db-file=./db-{{node_name}}"

@@ -1,0 +1,25 @@
+# Template for boot node runtime configuration
+# Copy this to validators/<team>/run_boot.yaml and adjust as needed
+
+# Docker image used to run the boot node
+image: org/boot-node:latest
+
+# Optional data directory inside the container (used for logs or cache)
+# Boot nodes do not use persistent disks by default
+data_dir: /var/lib/bootnode
+
+# Where to place the identity file inside the container
+p2p_identity_path: /identity.json
+
+# Default environment variables
+env:
+    RUST_LOG: info
+
+# Command-line arguments using placeholders:
+#   {{node_name}}, {{peer_id}}, {{team}}, {{listen_addresses}}, {{network}}
+# These will be filled in at deployment time.
+cmd:
+    - "--network={{network}}"
+    - "--listen-on={{listen_addresses}}"
+    - "--identity-config-file=/identity.json"
+    - "--bootstrap-interval-seconds=5" 

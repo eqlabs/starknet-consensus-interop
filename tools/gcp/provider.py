@@ -1,11 +1,12 @@
 from tools.gcp.ssh_utils import ssh_connect, ssh_run_command, ssh_upload_file, wait_for_ssh
 from tools.gcp.ssh_key_utils import ensure_ssh_key_exists
-from tools.types import Validator, Instance, Disk
+from tools.types import Validator, BootNode, Instance, Disk
 from googleapiclient import discovery
 from google.oauth2 import service_account
 import time
 import yaml
 import os
+from pathlib import Path
 from typing import List
 
 
@@ -119,13 +120,112 @@ class GCPProvider:
         ).execute()
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
 
-    def deploy_validator(self, instance: Instance, validator: Validator, peer_addrs: str = "", validator_addrs: str = ""):
+    def _compose_docker_cmd(self, name: str, image: str, env: dict, host_data_dir: str, container_data_dir: str,
+                             remote_identity_path: str, identity_target: str, listen_addresses: List[str],
+                             cmd_args: List[str]) -> str:
+        """
+        Build a docker run command string with:
+        - data and identity mounts
+        - port publishing derived from listen_addresses
+        - environment variables
+        - command args
+        """
+        cmd = "sudo docker run -d --restart unless-stopped \\\n"
+        cmd += f"  -v {host_data_dir}:{container_data_dir} \\\n"
+        cmd += f"  -v {remote_identity_path}:{identity_target} \\\n"
+
+        # Publish ports derived from listen_addresses
+        published = set()
+        for addr in listen_addresses:
+            parts = addr.strip().split("/")
+            if len(parts) >= 5:
+                proto = parts[3]
+                port = parts[4]
+                if proto in ("tcp", "udp") and port.isdigit():
+                    key = (proto, port)
+                    if key in published:
+                        continue
+                    published.add(key)
+                    cmd += f"  -p {port}:{port}/{proto} \\\n"
+
+        for k, v in (env or {}).items():
+            cmd += f"  -e {k}={v} \\\n"
+
+        cmd += f"  --name {name} {image} \\\n"
+
+        for arg in cmd_args:
+            cmd += f"  {arg} \\\n"
+
+        return cmd.rstrip(" \\\n")
+
+    def deploy_boot_node(self, instance: Instance, boot_node: BootNode, peer_addrs: str = "", network: str = "interop"):
+        """
+        Deploy a boot node container on the instance. Boot nodes do not use persistent disks.
+        """
+        name = boot_node["node_name"]
+        ip = self.get_instance_ip(name)
+        print(f"🚀 Deploying boot node on {name} ({ip})")
+
+        wait_for_ssh(ip)
+        client = ssh_connect(ip)
+
+        # Ensure Docker is installed
+        ssh_run_command(
+            client,
+            "if ! command -v docker > /dev/null; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io; fi"
+        )
+
+        # Upload identity file (validators/<team>/id_boot.json by convention)
+        local_identity_path = f"validators/{boot_node['team']}/id_boot.json"
+        remote_identity_path = "/home/ubuntu/identity.json"
+        ssh_upload_file(client, local_identity_path, remote_identity_path)
+        ssh_run_command(client, f"sudo chown ubuntu:ubuntu {remote_identity_path} && sudo chmod 644 {remote_identity_path}")
+
+        # Load runtime config (validators/<team>/run_boot.yaml preferred; fallback to boot_nodes/<team>/run.yaml if exists)
+        primary = Path(f"validators/{boot_node['team']}/run_boot.yaml")
+        fallback = Path(f"boot_nodes/{boot_node['team']}/run.yaml")
+        run_file = primary if primary.exists() else fallback
+        with open(run_file) as f:
+            config = yaml.safe_load(f)
+
+        identity_target = config.get("p2p_identity_path", "/identity.json")
+        container_data_dir = config.get("data_dir", "/data")
+        host_data_dir = f"/home/ubuntu/{name}-data"
+        ssh_run_command(client, f"mkdir -p {host_data_dir}")
+
+        # Render args with placeholders
+        cmd_args: List[str] = []
+        for arg in config["cmd"]:
+            rendered = arg.replace("{{node_name}}", name) \
+                          .replace("{{peer_id}}", boot_node["peer_id"]) \
+                          .replace("{{team}}", boot_node.get("team", "")) \
+                          .replace("{{listen_addresses}}", ",".join(boot_node["listen_addresses"])) \
+                          .replace("{{peer_addrs}}", peer_addrs or "") \
+                          .replace("{{bootstrap_addrs}}", peer_addrs or "") \
+                          .replace("{{network}}", network)
+            cmd_args.append(rendered)
+
+        cmd = self._compose_docker_cmd(
+            name=name,
+            image=config['image'],
+            env=config.get('env', {}),
+            host_data_dir=host_data_dir,
+            container_data_dir=container_data_dir,
+            remote_identity_path=remote_identity_path,
+            identity_target=identity_target,
+            listen_addresses=boot_node["listen_addresses"],
+            cmd_args=cmd_args,
+        )
+
+        # Restart with latest image
+        ssh_run_command(client, f"sudo docker stop {name} 2>/dev/null || true && sudo docker rm {name} 2>/dev/null || true")
+        ssh_run_command(client, f"sudo docker pull {config['image']}")
+        ssh_run_command(client, cmd)
+        client.close()
+
+    def deploy_validator(self, instance: Instance, validator: Validator, peer_addrs: str = "", validator_addrs: str = "", network: str = "interop"):
         """
         Deploy or redeploy the validator container on the instance.
-        - Ensures Docker is installed
-        - Uploads identity file and mounts persistent disk
-        - Publishes ports derived from validator listen_addresses
-        - Renders command with placeholders including {{peer_addrs}} and {{validator_addrs}}
         """
         name = validator["node_name"]
         ip = self.get_instance_ip(name)
@@ -140,66 +240,32 @@ class GCPProvider:
             "if ! command -v docker > /dev/null; then sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y docker.io; fi"
         )
 
-        # Allow user to use Docker without sudo (if SSH_USERNAME set)
-        ssh_user = os.environ.get("SSH_USERNAME")
-        if ssh_user:
-            ssh_run_command(client, f"sudo groupadd -f docker && sudo usermod -aG docker {ssh_user}")
-            # Ensure current socket permissions are correct (immediate convenience; full effect on next login)
-            ssh_run_command(client, "if [ -S /var/run/docker.sock ]; then sudo chown root:docker /var/run/docker.sock && sudo chmod 660 /var/run/docker.sock; fi")
-
         # Upload identity file
         local_identity_path = f"validators/{validator['team']}/id_{validator['address']}.json"
         remote_identity_path = "/home/ubuntu/identity.json"
         ssh_upload_file(client, local_identity_path, remote_identity_path)
 
-        # Fix permissions to ensure Docker can access it
+        # Fix permissions
         ssh_run_command(client, f"sudo chown ubuntu:ubuntu {remote_identity_path} && sudo chmod 644 {remote_identity_path}")
 
-        # Load runtime config
-        run_file = f"validators/{validator['team']}/run.yaml"
+        # Load runtime config (validators/<team>/run_validator.yaml preferred; fallback to run.yaml)
+        primary = Path(f"validators/{validator['team']}/run_validator.yaml")
+        fallback = Path(f"validators/{validator['team']}/run.yaml")
+        run_file = primary if primary.exists() else fallback
         with open(run_file) as f:
             config = yaml.safe_load(f)
 
-        # === Volume handling ===
         identity_target = config.get("p2p_identity_path", "/identity.json")
         container_data_dir = config["data_dir"]
         host_data_dir = f"/mnt/disks/{name}"
 
-        # Wait for disk device to become available
         _wait_for_disk(client, f"{name}-db")
-
-        # Mount persistent disk
         ssh_run_command(client, f"sudo mkdir -p {host_data_dir}")
         ssh_run_command(client, f"sudo mount -o discard,defaults /dev/disk/by-id/google-{name}-db {host_data_dir}")
         ssh_run_command(client, f"sudo chown ubuntu:ubuntu {host_data_dir}")
 
-        # === Compose docker run command ===
-        cmd = "sudo docker run -d --restart unless-stopped \\\n"
-        cmd += f"  -v {host_data_dir}:{container_data_dir} \\\n"
-        cmd += f"  -v {remote_identity_path}:{identity_target} \\\n"
-
-        # Publish ports derived from listen_addresses
-        published = set()
-        for addr in validator.get("listen_addresses", []):
-            parts = addr.strip().split("/")
-            # ['', 'ip4', '127.0.0.1', 'tcp', '50001', ...]
-            if len(parts) >= 5:
-                proto = parts[4 - 1]  # 'tcp' or 'udp' at index 3
-                port = parts[5 - 1]   # port at index 4
-                if proto in ("tcp", "udp") and port.isdigit():
-                    key = (proto, port)
-                    if key in published:
-                        continue
-                    published.add(key)
-                    cmd += f"  -p {port}:{port}/{proto} \\\n"
-
-        # Environment variables
-        for k, v in config.get("env", {}).items():
-            cmd += f"  -e {k}={v} \\\n"
-
-        cmd += f"  --name {name} {config['image']} \\\n"
-
-        # Command with templating (including peer_addrs and validator_addrs)
+        # Render args
+        cmd_args: List[str] = []
         for arg in config["cmd"]:
             rendered = arg.replace("{{address}}", validator["address"]) \
                           .replace("{{node_name}}", name) \
@@ -207,16 +273,26 @@ class GCPProvider:
                           .replace("{{team}}", validator["team"]) \
                           .replace("{{listen_addresses}}", ",".join(validator["listen_addresses"])) \
                           .replace("{{peer_addrs}}", peer_addrs or "") \
-                          .replace("{{validator_addrs}}", validator_addrs or "")
-            cmd += f"  {rendered} \\\n"
+                          .replace("{{bootstrap_addrs}}", peer_addrs or "") \
+                          .replace("{{validator_addrs}}", validator_addrs or "") \
+                          .replace("{{network}}", network)
+            cmd_args.append(rendered)
 
-        cmd = cmd.rstrip(" \\\n")
+        cmd = self._compose_docker_cmd(
+            name=name,
+            image=config['image'],
+            env=config.get('env', {}),
+            host_data_dir=host_data_dir,
+            container_data_dir=container_data_dir,
+            remote_identity_path=remote_identity_path,
+            identity_target=identity_target,
+            listen_addresses=validator["listen_addresses"],
+            cmd_args=cmd_args,
+        )
 
-        # Restart validator container with latest image
         ssh_run_command(client, f"sudo docker stop {name} 2>/dev/null || true && sudo docker rm {name} 2>/dev/null || true")
         ssh_run_command(client, f"sudo docker pull {config['image']}")
         ssh_run_command(client, cmd)
-
         client.close()
 
     def _get_instance_ip(self, name: str) -> str:
@@ -406,6 +482,7 @@ def _wait_for_operation(compute, project, zone, operation_name):
             break
         time.sleep(2)
 
+
 def _wait_for_disk(client, disk_name, timeout=30):
     """
     Wait for the udev device for the given persistent disk to settle on the VM.
@@ -416,6 +493,3 @@ def _wait_for_disk(client, disk_name, timeout=30):
     exit_code = stdout.channel.recv_exit_status()
     if exit_code != 0:
         raise RuntimeError(f"Disk device /dev/disk/by-id/google-{disk_name} did not settle within {timeout}s")
-
-
-# TODO: Why some of these wait functions are in the class and some are not?

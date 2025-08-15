@@ -7,6 +7,12 @@ class Validator(TypedDict):
     team: str
     node_name: str
 
+class BootNode(TypedDict):
+    peer_id: str
+    listen_addresses: List[str]
+    team: str
+    node_name: str
+
 class Instance(TypedDict):
     name: str
 

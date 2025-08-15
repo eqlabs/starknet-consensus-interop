@@ -18,7 +18,10 @@ Each team must add their validator configuration under the `validators/<team>` d
 
 - `validator_0xNNNN.json`: Metadata for each validator
 - `id_0xNNNN.json`: libp2p identity keypair
-- `run.yaml`: Runtime Docker config for the node
+- `run_validator.yaml`: Runtime Docker config for your validator node (see template)
+- (Optional) `boot.json`: Metadata for your boot node (one per team)
+- (Optional) `id_boot.json`: Identity for your boot node
+- (Optional) `run_boot.yaml`: Runtime Docker config for your boot node (see template)
 
 Once merged to `main`, a CI workflow will validate and aggregate all validator files.
 
@@ -62,7 +65,7 @@ Defines one validator for your team. One file per validator.
   - `tools/deploynet.py` uses them to:
     - Create/label instances and disks.
     - Render CLI args (`{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{listen_addresses}}`, etc.).
-    - Inject bootstrap peers (`{{peer_addrs}}`, libp2p multiaddrs, excludes self).
+    - Inject bootstrap peers (`{{bootstrap_addrs}}`, libp2p multiaddrs, excludes self).
     - Inject validator set (`{{validator_addrs}}`, other validator addresses, excludes self).
 
 Example:
@@ -85,6 +88,29 @@ Notes:
 
 ---
 
+## 🌐 (Optional) Boot Nodes
+
+Boot nodes help validators discover peers. They are optional — if none are configured, validators will bootstrap from other validators.
+
+- **Where to add them**
+  - Metadata: `validators/<team>/boot.json` (one per team)
+  - Runtime config: `validators/<team>/run_boot.yaml` (copy from `boot_nodes/run-template.yaml`)
+  - Identity file: `validators/<team>/id_boot.json`
+- **Metadata fields**
+  - `team` (string): Team slug (optional; inferred from directory if omitted)
+  - `node_name` (string): Unique name (e.g., `<team>-boot`)
+  - `peer_id` (string): libp2p PeerId corresponding to identity
+  - `listen_addresses` (string[]): multiaddrs the boot node listens on
+- **Deployment order**
+  - Boot nodes are provisioned and deployed first.
+  - Their IPs are saved to the state file and used to build `{{bootstrap_addrs}}` for validators.
+- **Placeholders**
+  - Boot node `run_boot.yaml` supports `{{listen_addresses}}`, `{{bootstrap_addrs}}` (if chaining boot nodes), and `{{network}}`.
+- **Disks**
+  - Boot nodes do not use persistent disks by default.
+
+---
+
 ## 🚀 Deploying the Network
 
 Deployment is handled via `tools/deploynet.py`, which provisions GCP resources and deploys validator containers using team configs.
@@ -102,6 +128,7 @@ pip install -r requirements.txt
 export GCP_PROJECT=<your-gcp-project-id>
 export GCP_ZONE=<your-preferred-zone>    # e.g. europe-west1-b
 export GOOGLE_APPLICATION_CREDENTIALS=/absolute/path/to/your/service-account.json
+export NETWORK_NAME=sepolia-testnet   # project-wide; all nodes should use the same value
 ```
 
 ### 3. Two-stage deployment
@@ -127,108 +154,34 @@ What happens:
 
 - Infra:
   - Creates/reuses GCP instances (tagged `validator`)
-  - Creates/reuses/attaches persistent disks
+  - Creates/reuses/attaches persistent disks (validators only)
   - Resolves and saves public IPs to `.deployed-state.json`
-  - Creates a GCP firewall rule `allow-validator-p2p` that allows the ports present in `listen_addresses` between validator instances
+  - Creates a GCP firewall rule `allow-validator-p2p` that allows the ports present in `listen_addresses` between instances
 
 - App:
+  - Deploys boot nodes first (if any), then validators
   - Uploads identity files
-  - Mounts disks and pulls images
-  - Starts each node container with team-specific `run.yaml`
-  - Injects bootstrap peers via `{{peer_addrs}}` (libp2p multiaddrs with `/p2p/<peer_id>`)
+  - Mounts disks (validators) and pulls images
+  - Starts each node container with team-specific `run_*` files
+  - Injects bootstrap peers via `{{bootstrap_addrs}}` (boot nodes if present; otherwise other validators)
   - Injects validator set via `{{validator_addrs}}` (CSV of other validators’ addresses)
+  - Injects `{{network}}` from `NETWORK_NAME` (default `sepolia-testnet`)
 
 > ✅ Re-running is safe: existing instances/disks are reused, containers are restarted cleanly.
 
 ### State file
 
-The deployer writes `.deployed-state.json` with instance IPs and metadata:
+The deployer writes `.deployed-state.json` with instance IPs and metadata.
 
-```json
-{
-    "metadata": {
-        "project": "your-project",
-        "zone": "your-zone",
-        "generated_at": "2025-08-08T12:34:56+00:00",
-        "version": 1
-    },
-    "validators": {
-        "pathfinder-alice": {
-            "node_name": "pathfinder-alice",
-            "team": "pathfinder",
-            "address": "0x1001",
-            "peer_id": "12D3Koo...",
-            "ip": "34.123.45.67"
-        }
-    }
-}
-```
+## 🧩 Team Runtime Config
 
-#### Why this file exists and how to use it
+- Validator run file: `validators/<team>/run_validator.yaml` (see `validators/run_validator.template.yaml`)
+- Boot node run file (optional): `validators/<team>/run_boot.yaml` (see `boot_nodes/run_boot.template.yaml`)
 
-- **Purpose**: Decouples provisioning from app deployment.
-  - Caches public IPs so we can render `{{peer_addrs}}` without re-querying GCP.
-  - Enables quick, idempotent `--stage app` redeploys.
+- **Placeholders you can use in validator `cmd`**
+    - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{bootstrap_addrs}}`, `{{validator_addrs}}`, `{{network}}`
+- **Placeholders you can use in boot node `cmd`**
+    - `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{bootstrap_addrs}}`, `{{network}}`
 
-- **What’s inside**: Only public information (project, zone, node metadata, public IPs). No secrets.
-
-- **Sharing**: Safe to share internally with teammates who have the right GCP access and SSH key.
-  - Avoid publishing externally; it exposes live public IPs.
-  - Teammates can run `--stage app` using this file to redeploy containers, but still need valid GCP credentials and SSH access.
-
-- **Versioning**: Environment-specific artifact. Do not commit it.
-  - By default, `.deployed-state.json` is already in `.gitignore`.
-  - You can delete it anytime; `--stage infra` will regenerate it.
-
-- **Drift/refresh**: If IPs change (recreates), re-run `--stage infra` to refresh the file. `--stage app` will also live-lookup any missing IPs as a fallback.
-
-## 🧩 Team Runtime Config (`validators/<team>/run.yaml`)
-
-- **Location**: `validators/<team>/run.yaml`
-- **Purpose**: Defines how your team’s validator container runs on each VM.
-- **Required keys**
-    - `image`: Docker image to run.
-    - `data_dir`: Container path where validator stores persistent data.
-    - `cmd`: List of CLI args (supports placeholders).
-- **Optional keys**
-    - `db_disk_gb`: Size of the persistent disk in GB (default 50).
-    - `p2p_identity_path`: Where to mount the uploaded identity in the container (default `/identity.json`). Must match your CLI flag.
-    - `env`: Map of environment variables.
-- **Placeholders you can use in `cmd`**
-    - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{peer_addrs}}`, `{{validator_addrs}}`
-    - `{{listen_addresses}}`: CSV from `validators.json`.
-    - `{{peer_addrs}}`: CSV of libp2p multiaddrs built from each peer’s listen address + public IP + `/p2p/<peer_id>` (excludes self).
-    - `{{validator_addrs}}`: CSV of other validators’ addresses (excludes self).
-
-Example `run.yaml`
-
-```yaml
-image: eqlabs/pathfinder:latest
-
-data_dir: /usr/share/pathfinder/data
-db_disk_gb: 50
-
-# Must match the CLI flag below
-p2p_identity_path: /identity.json
-
-env:
-    RUST_LOG: info
-
-cmd:
-    - "--validator-address={{address}}"
-    - "--p2p.consensus.identity-config-file=/identity.json"
-    - "--p2p.consensus.listen-on={{listen_addresses}}"
-    - "--bootstrap-peers={{peer_addrs}}"
-    - "--validators={{validator_addrs}}"
-```
-
-- **Networking note**: P2P ports are derived from `listen_addresses`. The deployer publishes these in Docker and creates a GCP firewall rule between validator instances automatically.
-- **Identity note**: The deployer uploads `validators/<team>/id_<address>.json` and mounts it at `p2p_identity_path`. Ensure your CLI flag uses the same path.
-- **Templating source**: Values come from `network-config/validators.json` and the saved `.deployed-state.json` created during `--stage infra`.
-
-
-## 🐣 New Here?
-
-Make sure you have:
-- A GCP project and enabled Compute Engine API
-- A service account with compute permissions
+- **Networking note**: P2P ports are derived from `listen_addresses`. The deployer publishes these in Docker and creates a GCP firewall rule between instances automatically.
+- **Identity note**: The deployer uploads the appropriate `id_*.json` and mounts it at `p2p_identity_path`. Ensure your CLI flag uses the same path.
