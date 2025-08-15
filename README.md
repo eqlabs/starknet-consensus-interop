@@ -14,14 +14,16 @@ This project automates the process of defining, validating, and deploying valida
 
 Each team must add their validator configuration under the `validators/<team>` directory and submit a pull request to `main`.
 
+> ✅ **Need a working example?** Check out [PR #1](https://github.com/eqlabs/starknet-consensus-interop/pull/1) for a complete example of adding validator nodes and a boot node for your team.
+
 ### Each team's directory must include:
 
 - `validator_0xNNNN.json`: Metadata for each validator
 - `id_0xNNNN.json`: libp2p identity keypair
 - `run_validator.yaml`: Runtime Docker config for your validator node (see template)
-- (Optional) `boot.json`: Metadata for your boot node (one per team)
-- (Optional) `id_boot.json`: Identity for your boot node
-- (Optional) `run_boot.yaml`: Runtime Docker config for your boot node (see template)
+- _(Optional)_ `boot.json`: Metadata for your boot node (one per team)
+- _(Optional)_ `id_boot.json`: Identity for your boot node
+- _(Optional)_ `run_boot.yaml`: Runtime Docker config for your boot node (see template)
 
 Once merged to `main`, a CI workflow will validate and aggregate all validator files.
 
@@ -88,16 +90,16 @@ Notes:
 
 ---
 
-## 🌐 (Optional) Boot Nodes
+## 🌐 _(Optional)_ Boot Nodes
 
-Boot nodes help validators discover peers. They are optional — if none are configured, validators will bootstrap from other validators.
+Boot nodes help validators discover peers. They are optional: if none are configured, validators will bootstrap from other validators.
 
 - **Where to add them**
   - Metadata: `validators/<team>/boot.json` (one per team)
   - Runtime config: `validators/<team>/run_boot.yaml` (copy from `boot_nodes/run-template.yaml`)
   - Identity file: `validators/<team>/id_boot.json`
 - **Metadata fields**
-  - `team` (string): Team slug (optional; inferred from directory if omitted)
+  - `team` (string): Team slug _(optional; inferred from directory if omitted)_
   - `node_name` (string): Unique name (e.g., `<team>-boot`)
   - `peer_id` (string): libp2p PeerId corresponding to identity
   - `listen_addresses` (string[]): multiaddrs the boot node listens on
@@ -176,7 +178,7 @@ The deployer writes `.deployed-state.json` with instance IPs and metadata.
 ## 🧩 Team Runtime Config
 
 - Validator run file: `validators/<team>/run_validator.yaml` (see `validators/run_validator.template.yaml`)
-- Boot node run file (optional): `validators/<team>/run_boot.yaml` (see `boot_nodes/run_boot.template.yaml`)
+- Boot node run file _(optional):_ `validators/<team>/run_boot.yaml` (see `boot_nodes/run_boot.template.yaml`)
 
 - **Placeholders you can use in validator `cmd`**
     - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{bootstrap_addrs}}`, `{{validator_addrs}}`, `{{network}}`
