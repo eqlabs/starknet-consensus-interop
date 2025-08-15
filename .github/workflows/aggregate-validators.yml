@@ -25,6 +25,18 @@ jobs:
         run: |
           python internal/merge_validators.py
 
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "Validator Bot"
+          git add network-config/validators.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Auto-update validators on merge"
+            git push
+          fi
+
       - name: Upload merged file as artifact
         uses: actions/upload-artifact@v4
         with:

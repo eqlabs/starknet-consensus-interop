@@ -17,6 +17,17 @@ jobs:
         with:
           python-version: '3.10'
 
+      - name: Check for manual edits to validators.json
+        run: |
+          if git diff --name-only ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }} | grep -q "network-config/validators.json"; then
+            echo "❌ ERROR: network-config/validators.json was manually edited in this PR"
+            echo "This file should only be updated through automated processes, not manual edits."
+            echo "Please revert any manual changes to this file."
+            exit 1
+          else
+            echo "✅ network-config/validators.json was not manually edited"
+          fi
+
       - name: Run validator metadata check
         run: |
           python internal/validate_validators.py
