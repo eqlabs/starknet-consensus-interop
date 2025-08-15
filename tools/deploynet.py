@@ -87,13 +87,18 @@ def _get_disk_size(team: str) -> int:
 
 def _collect_ips(provider: GCPProvider, nodes: List[dict]) -> dict:
     """
-    Resolve and return a map of node_name -> public IP address for a list of nodes (validators or boot nodes).
+    Resolve and return a map of node_name -> (external_ip, internal_ip) for a list of nodes.
     """
-    name_to_ip = {}
+    name_to_ips = {}
     for n in nodes:
         name = n["node_name"]
-        name_to_ip[name] = provider.get_instance_ip(name)
-    return name_to_ip
+        external_ip = provider.get_instance_ip(name)
+        internal_ip = provider.get_instance_internal_ip(name)
+        name_to_ips[name] = {
+            "external": external_ip,
+            "internal": internal_ip
+        }
+    return name_to_ips
 
 
 def _derive_p2p_ports_from_listen_addresses(nodes: List[dict]) -> List[dict]:
@@ -163,32 +168,35 @@ def provision_infra(provider: GCPProvider, validators: List[Validator], boot_nod
 
     # Collect and persist public IPs after all instances exist
     boot_ips = _collect_ips(provider, boot_nodes)
-    for name, ip in boot_ips.items():
-        state["boot_nodes"][name]["ip"] = ip
+    for name, ips in boot_ips.items():
+        state["boot_nodes"][name]["external_ip"] = ips["external"]
+        state["boot_nodes"][name]["internal_ip"] = ips["internal"]
 
     val_ips = _collect_ips(provider, validators)
-    for name, ip in val_ips.items():
-        state["validators"][name]["ip"] = ip
+    for name, ips in val_ips.items():
+        state["validators"][name]["external_ip"] = ips["external"]
+        state["validators"][name]["internal_ip"] = ips["internal"]
 
     save_state(state)
     print("✅ Infra provisioning complete and state saved.")
 
-
-def _normalize_multiaddr_with_ip(listen_addr: str, public_ip: str) -> str:
+def _normalize_multiaddr_with_internal_ip(listen_addr: str, internal_ip: str) -> str:
+    """
+    Replace 0.0.0.0 or 127.0.0.1 with the internal IP for internal communication.
+    """
     parts = listen_addr.strip().split("/")
     if len(parts) >= 4 and parts[1] == "ip4":
         host = parts[2]
         if host in ("127.0.0.1", "0.0.0.0"):
-            parts[2] = public_ip
+            parts[2] = internal_ip
     return "/".join(parts)
 
 
-def _build_bootstrap_multiaddrs(nodes: List[dict], name_to_ip: dict) -> dict:
+def _build_bootstrap_multiaddrs(nodes: List[dict], name_to_ips: dict) -> dict:
     """
     For each node in `nodes`, produce a CSV of multiaddrs for all other nodes:
-    - Start from each peer's first listen address
-    - Substitute peer's public IP if listen addr is localhost/0.0.0.0
-    - Append /p2p/<peer_id>
+    - Always use internal IPs for internal communication
+    - This ensures all validator-to-validator traffic stays within GCP's network
     """
     by_name = {n["node_name"]: n for n in nodes}
     result = {}
@@ -197,13 +205,15 @@ def _build_bootstrap_multiaddrs(nodes: List[dict], name_to_ip: dict) -> dict:
         for peer_name, pn in by_name.items():
             if peer_name == name:
                 continue
-            pub_ip = name_to_ip.get(peer_name)
-            if not pub_ip:
+            ips = name_to_ips.get(peer_name)
+            if not ips or not ips.get("internal"):
                 continue
+            internal_ip = ips["internal"]
             la_list = pn.get("listen_addresses", [])
             if not la_list:
                 continue
-            base = _normalize_multiaddr_with_ip(la_list[0], pub_ip)
+            # Replace 0.0.0.0 with internal IP
+            base = _normalize_multiaddr_with_internal_ip(la_list[0], internal_ip)
             peers.append(f"{base}/p2p/{pn['peer_id']}")
         # dedupe
         seen = set()
@@ -216,20 +226,21 @@ def _build_bootstrap_multiaddrs(nodes: List[dict], name_to_ip: dict) -> dict:
     return result
 
 
-def _build_boot_nodes_addrs_csv(boot_nodes: List[BootNode], name_to_ip: dict) -> str:
+def _build_boot_nodes_addrs_csv(boot_nodes: List[BootNode], name_to_ips: dict) -> str:
     """
-    Build a CSV of all boot node multiaddrs (no self-exclusion needed for validators).
+    Build a CSV of all boot node multiaddrs using internal IPs.
     """
     addrs = []
     seen = set()
     for b in boot_nodes:
-        ip = name_to_ip.get(b["node_name"]) or ""
-        if not ip:
+        ips = name_to_ips.get(b["node_name"]) or {}
+        internal_ip = ips.get("internal")
+        if not internal_ip:
             continue
         la_list = b.get("listen_addresses", [])
         if not la_list:
             continue
-        base = _normalize_multiaddr_with_ip(la_list[0], ip)
+        base = _normalize_multiaddr_with_internal_ip(la_list[0], internal_ip)
         full = f"{base}/p2p/{b['peer_id']}"
         if full not in seen:
             seen.add(full)
@@ -249,16 +260,19 @@ def _build_validator_addrs(validators: List[Validator]) -> dict:
 def deploy_boot_nodes(provider: GCPProvider, boot_nodes: List[BootNode]) -> None:
     state = load_state()
     bn_state = state.get("boot_nodes", {})
-    name_to_ip = {name: info.get("ip") for name, info in bn_state.items()}
+    name_to_ips = {name: {"external": info.get("external_ip"), "internal": info.get("internal_ip")} 
+                   for name, info in bn_state.items()}
 
     # Fallback to live lookup
     for b in boot_nodes:
         name = b["node_name"]
-        if not name_to_ip.get(name):
-            name_to_ip[name] = provider.get_instance_ip(name)
+        if not name_to_ips.get(name):
+            external_ip = provider.get_instance_ip(name)
+            internal_ip = provider.get_instance_internal_ip(name)
+            name_to_ips[name] = {"external": external_ip, "internal": internal_ip}
 
-    # Build bootstrap multiaddrs among boot nodes (for their own clustering, if any)
-    bootstrap_map = _build_bootstrap_multiaddrs(boot_nodes, name_to_ip)
+    # Build bootstrap multiaddrs among boot nodes using internal IPs
+    bootstrap_map = _build_bootstrap_multiaddrs(boot_nodes, name_to_ips)
 
     for b in boot_nodes:
         name = b["node_name"]
@@ -271,27 +285,29 @@ def deploy_apps(provider: GCPProvider, validators: List[Validator], boot_nodes: 
     val_state = state.get("validators", {})
     bn_state = state.get("boot_nodes", {})
 
-    name_to_ip_vals = {name: info.get("ip") for name, info in val_state.items()}
-    name_to_ip_boot = {name: info.get("ip") for name, info in bn_state.items()}
+    name_to_ips_vals = {name: {"external": info.get("external_ip"), "internal": info.get("internal_ip")} 
+                        for name, info in val_state.items()}
+    name_to_ips_boot = {name: {"external": info.get("external_ip"), "internal": info.get("internal_ip")} 
+                        for name, info in bn_state.items()}
 
     for v in validators:
         name = v["node_name"]
-        if not name_to_ip_vals.get(name):
-            name_to_ip_vals[name] = provider.get_instance_ip(name)
+        if not name_to_ips_vals.get(name):
+            name_to_ips_vals[name] = provider.get_instance_ip(name)
 
     for b in boot_nodes:
         name = b["node_name"]
-        if not name_to_ip_boot.get(name):
-            name_to_ip_boot[name] = provider.get_instance_ip(name)
+        if not name_to_ips_boot.get(name):
+            name_to_ips_boot[name] = provider.get_instance_ip(name)
 
     # Build bootstrap addresses for validators:
     if boot_nodes:
         # Use all boot nodes for every validator
-        bootstrap_addrs_all = _build_boot_nodes_addrs_csv(boot_nodes, name_to_ip_boot)
+        bootstrap_addrs_all = _build_boot_nodes_addrs_csv(boot_nodes, name_to_ips_boot)
         bootstrap_map = None
     else:
         # Fall back to using other validators as peers (self excluded per map)
-        bootstrap_map = _build_bootstrap_multiaddrs(validators, name_to_ip_vals)
+        bootstrap_map = _build_bootstrap_multiaddrs(validators, name_to_ips_vals)
         bootstrap_addrs_all = ""
 
     validator_addrs_map = _build_validator_addrs(validators)

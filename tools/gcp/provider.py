@@ -45,7 +45,17 @@ class GCPProvider:
 
         existing = self.compute.instances().list(project=self.project, zone=self.zone).execute()
         if any(i["name"] == name for i in existing.get("items", [])):
-            print(f"⚠️ Instance '{name}' already exists, skipping creation.")
+            print(f"⚠️ Instance '{name}' already exists, ensuring tags are set...")
+            # Ensure existing instances have the correct tags
+            instance = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
+            current_tags = set(instance.get("tags", {}).get("items", []))
+            if "validator" not in current_tags:
+                print(f"🔧 Adding validator tag to {name}")
+                new_tags = list(current_tags | {"validator"})
+                body = {"tags": {"items": new_tags}}
+                op = self.compute.instances().setTags(project=self.project, zone=self.zone, instance=name, body=body).execute()
+                _wait_for_operation(self.compute, self.project, self.zone, op["name"])
+                print(f"✅ Tags updated for {name}")
             return {"name": name}
 
         config = {
@@ -126,27 +136,17 @@ class GCPProvider:
         """
         Build a docker run command string with:
         - data and identity mounts
-        - port publishing derived from listen_addresses
+        - host network mode for P2P applications
         - environment variables
         - command args
         """
         cmd = "sudo docker run -d --restart unless-stopped \\\n"
+        cmd += "  --network=host \\\n"  # Use host network mode for P2P
         cmd += f"  -v {host_data_dir}:{container_data_dir} \\\n"
         cmd += f"  -v {remote_identity_path}:{identity_target} \\\n"
 
-        # Publish ports derived from listen_addresses
-        published = set()
-        for addr in listen_addresses:
-            parts = addr.strip().split("/")
-            if len(parts) >= 5:
-                proto = parts[3]
-                port = parts[4]
-                if proto in ("tcp", "udp") and port.isdigit():
-                    key = (proto, port)
-                    if key in published:
-                        continue
-                    published.add(key)
-                    cmd += f"  -p {port}:{port}/{proto} \\\n"
+        # Note: No port publishing needed with host network mode
+        # The application binds directly to the host's network interfaces
 
         for k, v in (env or {}).items():
             cmd += f"  -e {k}={v} \\\n"
@@ -295,22 +295,28 @@ class GCPProvider:
         ssh_run_command(client, cmd)
         client.close()
 
-    def _get_instance_ip(self, name: str) -> str:
+    def get_instance_internal_ip(self, instance_name: str) -> str:
         """
-        Internal: Fetch public IP for an instance if already assigned.
-        Raises a descriptive error if the structure is missing.
+        Get the internal IP address for an instance.
         """
-        inst = self.compute.instances().get(project=self.project, zone=self.zone, instance=name).execute()
-        nics = inst.get("networkInterfaces", [])
-        if not nics:
-            raise RuntimeError(f"Instance '{name}' has no network interfaces")
-        access_configs = nics[0].get("accessConfigs", [])
-        if not access_configs:
-            raise RuntimeError(f"Instance '{name}' has no external access config; cannot fetch public IP")
-        ip = access_configs[0].get("natIP")
-        if not ip:
-            raise RuntimeError(f"Public IP not yet assigned for instance '{name}'")
-        return ip
+        try:
+            instance = self.compute.instances().get(
+                project=self.project,
+                zone=self.zone,
+                instance=instance_name
+            ).execute()
+
+            # Get the internal IP from the network interface
+            network_interfaces = instance.get("networkInterfaces", [])
+            if network_interfaces:
+                internal_ip = network_interfaces[0].get("networkIP")
+                if internal_ip:
+                    return internal_ip
+
+            raise Exception(f"No internal IP found for instance {instance_name}")
+        except Exception as e:
+            print(f"⚠️ Failed to get internal IP for {instance_name}: {e}")
+            return None
 
     def get_instance_ip(self, name: str) -> str:
         """
