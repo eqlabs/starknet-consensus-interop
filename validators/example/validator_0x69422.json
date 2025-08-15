@@ -1,0 +1,10 @@
+{
+    "team": "example",
+    "node_name": "example-bob",
+    "address": "0x69422",
+    "listen_addresses": [
+      "/ip4/0.0.0.0/tcp/50001",
+      "/ip4/0.0.0.0/tcp/50002"
+    ],
+    "peer_id": "12D3KooWB3hTqsUvuWg2TEXzAYUfADrobnt4dNTihkhuRvJicXJx"
+}

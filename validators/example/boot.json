@@ -1,0 +1,9 @@
+{
+    "team": "example",
+    "node_name": "example-boot",
+    "address": "0x69420",
+    "listen_addresses": [
+        "/ip4/0.0.0.0/tcp/50001"
+    ],
+    "peer_id": "12D3KooWBYBUYATSEHVBhzkZphehnGNnUR4kvi1uchCcw9FW64jA"
+}
