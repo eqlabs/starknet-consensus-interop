@@ -15,6 +15,23 @@ db_disk_gb: 50
 # Ensure this matches the CLI flag below.
 p2p_identity_path: /identity.json
 
+# Snapshot configuration (optional)
+# If specified, the snapshot will be downloaded and extracted before starting the container
+snapshot:
+    # URL to download the snapshot from
+    url: ""
+    # Optional SHA256 checksum to verify download integrity
+    checksum: ""
+    # Command to extract the snapshot
+    # For best space efficiency, use streaming commands with {target} placeholder
+    # Examples:
+    #  - "zstd -d -o {target}" (streaming)
+    #  - "zstd -T0 -d {filename} -o {target}" (file-based)
+    extract_command: ""
+    # Relative path within data_dir where the extracted file should be placed
+    # Example: "mainnet.sqlite" (will be placed at data_dir/mainnet.sqlite)
+    target_path: ""
+
 # Default environment variables
 env:
     RUST_LOG: info

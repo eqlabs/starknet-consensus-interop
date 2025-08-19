@@ -22,4 +22,4 @@ cmd:
     - "--network={{network}}"
     - "--listen-on={{listen_addresses}}"
     - "--identity-config-file=/identity.json"
-    - "--bootstrap-interval-seconds=5" 
+    - "--bootstrap-interval-seconds=5"

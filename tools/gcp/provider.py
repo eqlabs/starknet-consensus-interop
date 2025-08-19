@@ -1,6 +1,6 @@
 from tools.gcp.ssh_utils import ssh_connect, ssh_run_command, ssh_upload_file, wait_for_ssh
 from tools.gcp.ssh_key_utils import ensure_ssh_key_exists
-from tools.types import Validator, BootNode, Instance, Disk
+from tools.types import Validator, BootNode, Instance, Disk, SnapshotConfig
 from googleapiclient import discovery
 from google.oauth2 import service_account
 import time
@@ -79,6 +79,67 @@ class GCPProvider:
         op = self.compute.instances().insert(project=self.project, zone=self.zone, body=config).execute()
         _wait_for_operation(self.compute, self.project, self.zone, op["name"])
         return {"name": name}
+
+    def _download_and_extract_snapshot(self, client, snapshot_config: SnapshotConfig, host_data_dir: str) -> None:
+        """
+        Download and extract a snapshot using the most space-efficient method available.
+        Prioritizes streaming extraction to avoid temporary files when possible.
+        """
+        if not snapshot_config.get("url"):
+            return
+
+        print(f"📥 Downloading snapshot from {snapshot_config['url']}")
+        
+        # Install required tools
+        ssh_run_command(client, "sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y wget curl zstd")
+        
+        url = snapshot_config["url"]
+        # Combine host_data_dir with relative target_path
+        relative_target_path = snapshot_config["target_path"]
+        full_target_path = f"{host_data_dir}/{relative_target_path}"
+        
+        # Ensure the target directory exists
+        target_dir = str(Path(full_target_path).parent)
+        ssh_run_command(client, f"sudo mkdir -p {target_dir}")
+        ssh_run_command(client, f"sudo chown ubuntu:ubuntu {target_dir}")
+        
+        extract_cmd = snapshot_config["extract_command"]
+        
+        # Check if we can use streaming (most space-efficient)
+        if "{filename}" not in extract_cmd:
+            # Pure streaming command - most efficient
+            final_extract_cmd = extract_cmd.replace("{target}", full_target_path)
+            print(f"🔧 Streaming snapshot using: {final_extract_cmd}")
+            ssh_run_command(client, f"curl -s -L '{url}' | {final_extract_cmd}")
+        else:
+            # Command needs a local filename (less efficient but necessary)
+            temp_filename = f"/tmp/snapshot_{int(time.time())}"
+            print(f"⚠️ Using temporary file for extraction (less space-efficient)")
+            
+            # Download the file
+            download_cmd = f"wget --continue '{url}' -O {temp_filename}"
+            ssh_run_command(client, download_cmd)
+            
+            # Verify checksum if provided
+            if snapshot_config.get("checksum"):
+                checksum = snapshot_config["checksum"]
+                if checksum.startswith("sha256:"):
+                    expected_hash = checksum[7:]
+                    ssh_run_command(client, f"echo '{expected_hash} {temp_filename}' | sha256sum -c")
+                else:
+                    print(f"⚠️ Unsupported checksum format: {checksum}")
+            
+            # Extract using the command with placeholders replaced
+            final_extract_cmd = extract_cmd.replace("{filename}", temp_filename).replace("{target}", full_target_path)
+            print(f"🔧 Extracting snapshot using: {final_extract_cmd}")
+            ssh_run_command(client, final_extract_cmd)
+            
+            # Clean up temp file immediately
+            ssh_run_command(client, f"rm -f {temp_filename}")
+        
+        # Ensure proper ownership
+        ssh_run_command(client, f"sudo chown ubuntu:ubuntu {full_target_path}")
+        print(f"✅ Snapshot processed and placed at {full_target_path}")
 
     def create_volume(self, validator: Validator, disk_size: int = 50) -> str:
         """
@@ -263,6 +324,11 @@ class GCPProvider:
         ssh_run_command(client, f"sudo mkdir -p {host_data_dir}")
         ssh_run_command(client, f"sudo mount -o discard,defaults /dev/disk/by-id/google-{name}-db {host_data_dir}")
         ssh_run_command(client, f"sudo chown ubuntu:ubuntu {host_data_dir}")
+
+        # Download and extract snapshot if configured
+        snapshot_config = config.get("snapshot")
+        if snapshot_config:
+            self._download_and_extract_snapshot(client, snapshot_config, host_data_dir)
 
         # Render args
         cmd_args: List[str] = []

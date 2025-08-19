@@ -47,46 +47,38 @@ Each validator metadata file must use an address from your team's assigned range
 
 ---
 
-## 🧾 Validator metadata file (`validators/<team>/validator_0xNNNN.json`)
+## 🧾 Validator Configuration
 
-Defines one validator for your team. One file per validator.
+**For complete validator setup documentation, see [`validators/README.md`](validators/README.md).**
 
-- **Filename**: `validator_<address>.json` (e.g., `validator_0x4001.json`)
-- **Location**: `validators/<team>/`
-- **Required fields**
-  - `team` (string): Team slug; must match the directory name (e.g., `pathfinder`).
-  - `node_name` (string): DNS-safe, unique across all validators; used for GCP instance, disk, and container names. Suggested format: `<team>-<name>` (e.g., `pathfinder-alice`).
-  - `address` (string): Hex address assigned to your team (e.g., `0x4001`).
-  - `peer_id` (string): libp2p PeerId corresponding to your identity file.
-  - `listen_addresses` (string[]): libp2p multiaddrs the node will listen on (e.g., `/ip4/0.0.0.0/tcp/50001`). Multiple allowed.
-- **Identity file**
-  - Place `id_<address>.json` alongside this file (e.g., `id_0x4001.json`). It’s uploaded to the VM and mounted at `p2p_identity_path` (default `/identity.json`).
-  - The `peer_id` in this JSON should match the identity’s public key.
-- **How it’s used**
-  - These files are aggregated into `network-config/validators.json` by CI.
-  - `tools/deploynet.py` uses them to:
-    - Create/label instances and disks.
-    - Render CLI args (`{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{listen_addresses}}`, etc.).
-    - Inject bootstrap peers (`{{bootstrap_addrs}}`, libp2p multiaddrs, excludes self).
-    - Inject validator set (`{{validator_addrs}}`, other validator addresses, excludes self).
+### Quick Overview
 
-Example:
+Each team creates a subdirectory under `validators/` with:
+
+- `validator_0xNNNN.json` - Validator metadata (address, peer_id, etc.)
+- `id_0xNNNN.json` - libp2p identity keypair
+- `run_validator.yaml` - Runtime Docker configuration
+- Optional: `boot.json`, `id_boot.json`, `run_boot.yaml` for boot nodes
+
+### Required Fields
+
+- `team` (string): Team slug matching directory name
+- `node_name` (string): DNS-safe, unique name (e.g., `pathfinder-alice`)
+- `address` (string): Hex address from your team's assigned range
+- `peer_id` (string): libp2p PeerId from your identity file
+- `listen_addresses` (string[]): libp2p multiaddrs for P2P networking
+
+### Example
+
 ```json
 {
   "team": "pathfinder",
   "node_name": "pathfinder-alice",
   "address": "0x4001",
-  "listen_addresses": [
-    "/ip4/0.0.0.0/tcp/50001"
-  ],
+  "listen_addresses": ["/ip4/0.0.0.0/tcp/50001"],
   "peer_id": "12D3KooWDJryKaxjwNCk6yTtZ4GbtbLrH7JrEUTngvStaDttLtid"
 }
 ```
-
-Notes:
-- If you expose P2P ports, ensure `listen_addresses` includes the correct ports. The deployer will publish these ports in Docker and open a GCP firewall rule between validator instances automatically.
-- Do not edit `network-config/validators.json` directly; it’s generated.
-
 
 ---
 
@@ -94,22 +86,34 @@ Notes:
 
 Boot nodes help validators discover peers. They are optional: if none are configured, validators will bootstrap from other validators.
 
-- **Where to add them**
-  - Metadata: `validators/<team>/boot.json` (one per team)
-  - Runtime config: `validators/<team>/run_boot.yaml` (copy from `boot_nodes/run-template.yaml`)
-  - Identity file: `validators/<team>/id_boot.json`
-- **Metadata fields**
-  - `team` (string): Team slug _(optional; inferred from directory if omitted)_
-  - `node_name` (string): Unique name (e.g., `<team>-boot`)
-  - `peer_id` (string): libp2p PeerId corresponding to identity
-  - `listen_addresses` (string[]): multiaddrs the boot node listens on
-- **Deployment order**
-  - Boot nodes are provisioned and deployed first.
-  - Their IPs are saved to the state file and used to build `{{bootstrap_addrs}}` for validators.
-- **Placeholders**
-  - Boot node `run_boot.yaml` supports `{{listen_addresses}}`, `{{bootstrap_addrs}}` (if chaining boot nodes), and `{{network}}`.
-- **Disks**
-  - Boot nodes do not use persistent disks by default.
+### Quick Setup
+
+- `boot.json` - Boot node metadata
+- `run_boot.yaml` - Runtime configuration (copy from `run_boot.template.yaml`)
+- `id_boot.json` - Boot node identity
+
+**For detailed boot node configuration, see [`validators/README.md`](validators/README.md).**
+
+---
+
+## 📥 Snapshot Downloads
+
+Validators can now automatically download and extract database snapshots during deployment, significantly reducing sync time. This feature is completely optional and maintains full backward compatibility.
+
+**For detailed configuration and examples, see [`validators/README.md`](validators/README.md).**
+
+### Quick Start
+
+Add a `snapshot` section to your `run_validator.yaml`:
+
+```yaml
+snapshot:
+    url: "https://example.com/snapshot.sqlite.zst"
+    extract_command: "zstd -T0 -d {filename} -o {target}"
+    target_path: "mainnet.sqlite"
+```
+
+The system automatically downloads, extracts, and places snapshots before starting your validator containers.
 
 ---
 
@@ -164,9 +168,10 @@ What happens:
   - Deploys boot nodes first (if any), then validators
   - Uploads identity files
   - Mounts disks (validators) and pulls images
+  - Downloads and extracts database snapshots if configured in `run_validator.yaml`
   - Starts each node container with team-specific `run_*` files
   - Injects bootstrap peers via `{{bootstrap_addrs}}` (boot nodes if present; otherwise other validators)
-  - Injects validator set via `{{validator_addrs}}` (CSV of other validators’ addresses)
+  - Injects validator set via `{{validator_addrs}}` (CSV of other validators' addresses)
   - Injects `{{network}}` from `NETWORK_NAME` (default `sepolia-testnet`)
 
 > ✅ Re-running is safe: existing instances/disks are reused, containers are restarted cleanly.
