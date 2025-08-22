@@ -179,16 +179,3 @@ What happens:
 ### State file
 
 The deployer writes `.deployed-state.json` with instance IPs and metadata.
-
-## 🧩 Team Runtime Config
-
-- Validator run file: `validators/<team>/run_validator.yaml` (see `validators/run_validator.template.yaml`)
-- Boot node run file _(optional):_ `validators/<team>/run_boot.yaml` (see `boot_nodes/run_boot.template.yaml`)
-
-- **Placeholders you can use in validator `cmd`**
-    - `{{address}}`, `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{bootstrap_addrs}}`, `{{validator_addrs}}`, `{{network}}`
-- **Placeholders you can use in boot node `cmd`**
-    - `{{node_name}}`, `{{peer_id}}`, `{{team}}`, `{{listen_addresses}}`, `{{bootstrap_addrs}}`, `{{network}}`
-
-- **Networking note**: P2P ports are derived from `listen_addresses`. The deployer publishes these in Docker and creates a GCP firewall rule between instances automatically.
-- **Identity note**: The deployer uploads the appropriate `id_*.json` and mounts it at `p2p_identity_path`. Ensure your CLI flag uses the same path.
